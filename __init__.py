@@ -1,5 +1,5 @@
 import bpy
-from bpy.props import IntProperty, BoolProperty, StringProperty
+from bpy.props import IntProperty, BoolProperty, StringProperty, EnumProperty
 from bpy.app.handlers import persistent
 import time
 import os
@@ -8,9 +8,9 @@ import tempfile
 bl_info = {
     "name": "Custom Autosave",
     "author": "SlaneDRV",
-    "version": (1, 6),
+    "version": (1, 7),
     "blender": (2, 80, 0),
-    "location": "View3D > Sidebar > Custom Autosave",
+    "location": "Properties > Output > Custom Autosave",
     "description": "Customizable autosave functionality with option for unsaved files",
     "category": "System",
 }
@@ -19,7 +19,7 @@ class AutosaveSettings(bpy.types.PropertyGroup):
     enabled: BoolProperty(
         name="Enable Autosave",
         description="Enable or disable autosave",
-        default=True
+        default=False
     )
     interval: IntProperty(
         name="Autosave Interval",
@@ -40,6 +40,23 @@ class AutosaveSettings(bpy.types.PropertyGroup):
         subtype='DIR_PATH'
     )
 
+class AutosaveAddonPreferences(bpy.types.AddonPreferences):
+    bl_idname = __name__
+
+    panel_location: EnumProperty(
+        name="Panel Location",
+        items=[
+            ('OUTPUT', "Output Properties", "Show in Output Properties"),
+            ('VIEW3D', "3D Viewport", "Show in 3D Viewport sidebar"),
+        ],
+        default='OUTPUT',
+        description="Choose where to display the Custom Autosave panel"
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "panel_location")
+
 def get_autosave_settings():
     if hasattr(bpy.context, 'scene') and hasattr(bpy.context.scene, 'autosave_settings'):
         return bpy.context.scene.autosave_settings
@@ -58,38 +75,58 @@ def auto_save():
                 full_path = os.path.join(temp_path, file_name)
                 
                 bpy.ops.wm.save_as_mainfile(filepath=full_path)
-                print(f"Unsaved file automatically saved to {full_path}")
-            else:
-                print("File not saved. Autosave skipped.")
-                return settings.interval
         else:
-            print(f"Autosave triggered at {time.strftime('%H:%M:%S')}")
             bpy.ops.wm.save_mainfile()
-            print(f"File saved at {time.strftime('%H:%M:%S')}")
-    else:
-        print("Autosave is disabled or settings are not available")
     
-    return settings.interval if settings else 60
+    return settings.interval if settings and settings.enabled else None
 
 def init_autosave_timer():
     if bpy.app.timers.is_registered(auto_save):
         bpy.app.timers.unregister(auto_save)
     
     settings = get_autosave_settings()
-    interval = settings.interval if settings else 60
-    bpy.app.timers.register(auto_save, first_interval=interval)
-    print(f"Autosave timer initialized with interval {interval} seconds")
+    if settings and settings.enabled:
+        interval = settings.interval
+        bpy.app.timers.register(auto_save, first_interval=interval)
 
 class AutosavePanel(bpy.types.Panel):
     bl_label = "Custom Autosave"
     bl_idname = "OBJECT_PT_custom_autosave"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "output"
+
+    @classmethod
+    def poll(cls, context):
+        preferences = context.preferences.addons[__name__].preferences
+        return (preferences.panel_location == 'OUTPUT' and
+                context.scene is not None)
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.autosave_settings
+
+        layout.prop(settings, "enabled")
+        layout.prop(settings, "interval")
+        layout.prop(settings, "save_unsaved")
+        
+        if settings.save_unsaved:
+            layout.prop(settings, "temp_path")
+        
+        layout.operator("wm.restart_autosave_timer")
+
+class AutosavePanelViewport(bpy.types.Panel):
+    bl_label = "Custom Autosave"
+    bl_idname = "VIEW3D_PT_custom_autosave"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'Custom Autosave'
 
     @classmethod
     def poll(cls, context):
-        return context.scene is not None
+        preferences = context.preferences.addons[__name__].preferences
+        return (preferences.panel_location == 'VIEW3D' and
+                context.scene is not None)
 
     def draw(self, context):
         layout = self.layout
@@ -110,23 +147,44 @@ class WM_OT_RestartAutosaveTimer(bpy.types.Operator):
 
     def execute(self, context):
         init_autosave_timer()
-        self.report({'INFO'}, f"Autosave timer restarted with interval {context.scene.autosave_settings.interval} seconds")
+        self.report({'INFO'}, f"Autosave timer {'started' if context.scene.autosave_settings.enabled else 'stopped'}")
         return {'FINISHED'}
 
+classes = (
+    AutosaveSettings,
+    AutosaveAddonPreferences,
+    AutosavePanel,
+    AutosavePanelViewport,
+    WM_OT_RestartAutosaveTimer,
+)
+
+@persistent
+def reset_autosave_settings(dummy):
+    settings = get_autosave_settings()
+    if settings:
+        settings.enabled = False
+        settings.save_unsaved = False
+
+def register_handlers():
+    bpy.app.handlers.load_post.append(reset_autosave_settings)
+
+def unregister_handlers():
+    bpy.app.handlers.load_post.remove(reset_autosave_settings)
+
 def register():
-    bpy.utils.register_class(AutosaveSettings)
-    bpy.utils.register_class(AutosavePanel)
-    bpy.utils.register_class(WM_OT_RestartAutosaveTimer)
+    for cls in classes:
+        bpy.utils.register_class(cls)
     bpy.types.Scene.autosave_settings = bpy.props.PointerProperty(type=AutosaveSettings)
     bpy.app.timers.register(init_autosave_timer, first_interval=1.0)
+    register_handlers()
 
 def unregister():
     if bpy.app.timers.is_registered(auto_save):
         bpy.app.timers.unregister(auto_save)
-    bpy.utils.unregister_class(WM_OT_RestartAutosaveTimer)
-    bpy.utils.unregister_class(AutosavePanel)
-    bpy.utils.unregister_class(AutosaveSettings)
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
     del bpy.types.Scene.autosave_settings
+    unregister_handlers()
 
 if __name__ == "__main__":
     register()
